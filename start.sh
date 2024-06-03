@@ -2,48 +2,83 @@
 
 # Function to check if a command exists
 command_exists() {
-  command -v "$1" >/dev/null 2>&1
+    command -v "$1" >/dev/null 2>&1
 }
 
-# Change to the backend directory
-cd backend
+# Function to stop a service if it is running
+stop_service_if_running() {
+    local port=$1
+    local service_name=$2
+    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null ; then
+        echo "$service_name is already running. Stopping it..."
+        kill $(lsof -t -i:$port)
+    fi
+}
 
-# Install Go packages in the vendor directory
+# Function to start a service
+start_service() {
+    local service_command=$1
+    local service_name=$2
+    echo "Starting $service_name..."
+    $service_command &
+}
+
+# Change to a specified directory and check for success
+change_dir() {
+    local dir=$1
+    if cd $dir; then
+        echo "Changed to directory: $dir"
+    else
+        echo "Failed to change to directory: $dir"
+        exit 1
+    fi
+}
+
+# Backend setup
+change_dir "backend/GPT"
+
 echo "Installing Go packages in the vendor directory..."
 go mod vendor
 
-# Check if the backend server is already running
-if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null ; then
-    echo "Backend server is already running. Stopping it..."
-    kill $(lsof -t -i:8080)
+stop_service_if_running 8080 "Backend server"
+start_service "go run main.go" "backend server"
+
+# spaCy setup
+change_dir "../spacy"
+
+if ! command_exists python3 ; then
+    echo "Python is not installed. Please install Python and try again."
+    exit 1
 fi
 
-# Start the backend server
-echo "Starting backend server..."
-go run main.go &
+echo "Creating a virtual environment..."
+python3 -m venv venv
 
-# Change to the frontend directory
-cd ../frontend
+echo "Activating the virtual environment..."
+source venv/bin/activate
 
-# Check if Bun is installed
+echo "Installing Python packages from requirements.txt..."
+pip install -r requirements.txt
+
+echo "Downloading the spaCy English model..."
+python -m spacy download en_core_web_sm
+
+stop_service_if_running 5000 "spaCy service"
+start_service "python3 main.py" "spaCy service"
+
+# Frontend setup
+change_dir "../../frontend"
+
 if ! command_exists bun ; then
     echo "Bun is not installed. Please install Bun and try again."
     exit 1
 fi
 
-# Install frontend packages using Bun
 echo "Installing frontend packages..."
 bun install
 
-# Check if the frontend server is already running
-if lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null ; then
-    echo "Frontend server is already running. Stopping it..."
-    kill $(lsof -t -i:3000)
-fi
+stop_service_if_running 3000 "Frontend server"
+start_service "bun run start" "frontend development server"
 
-# Start the frontend development server in the background
-echo "Starting frontend development server..."
-bun run start &
-
-# Wait for the backend and frontend servers to finish
+# Wait for all background jobs to finish
 wait

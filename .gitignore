@@ -22,12 +22,14 @@ frontend/*.sln
 frontend/*.sw?
 
 # Backend
-backend/vendor/
-backend/*.test
-backend/*.out
-backend/*.exe
-backend/*.dll
-backend/*.so
-backend/*.dylib
-backend/.env
-backend/*.log
+backend/GPT/vendor/
+backend/GPT/*.test
+backend/GPT/*.out
+backend/GPT/*.exe
+backend/GPT/*.dll
+backend/GPT/*.so
+backend/GPT/*.dylib
+backend/GPT/.env
+backend/GPT/*.log
+
+backend/spaCy/.idea/

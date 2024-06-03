@@ -18,6 +18,7 @@ import (
 
 const (
     openAIURL     = "https://api.openai.com/v1/chat/completions"
+    spacyURL      = "http://localhost:5000/anonymize"
     contentType   = "application/json"
     authHeader    = "Authorization"
     openAITimeout = 10 * time.Second
@@ -40,46 +41,60 @@ type (
         } `json:"choices"`
     }
 
-    OpenAIClient interface {
+    Client interface {
         Anonymize(ctx context.Context, text string) (string, error)
     }
 
-    openAIClient struct {
+    HTTPClient struct {
         apiKey string
+        url    string
         client *http.Client
     }
 )
 
-func NewOpenAIClient(apiKey string) OpenAIClient {
-    return &openAIClient{
+func NewHTTPClient(apiKey, url string, timeout time.Duration) *HTTPClient {
+    return &HTTPClient{
         apiKey: apiKey,
-        client: &http.Client{Timeout: openAITimeout},
+        url:    url,
+        client: &http.Client{Timeout: timeout},
     }
 }
 
-func (c *openAIClient) Anonymize(ctx context.Context, text string) (string, error) {
-    prompt := fmt.Sprintf(`Please anonymize the text by redacting any names of people with REDACTED. If there is a first and last name it should be replaced with one REDACTED. You should comprehensively search the text for names and redact them so that in the end result there should be not a single instance of any name. Here is the text: %s`, text)
+func (c *HTTPClient) Anonymize(ctx context.Context, text string) (string, error) {
+    var payload interface{}
 
-    payload := map[string]interface{}{
-        "model": "gpt-3.5-turbo-0125",
-        "messages": []map[string]interface{}{
-            {"role": "user", "content": prompt},
-        },
-        "max_tokens": 500,
+    if c.url == spacyURL {
+        payload = map[string]interface{}{
+            "text": text,
+        }
+    } else {
+        payload = map[string]interface{}{
+            "model": "gpt-3.5-turbo-0125",
+            "messages": []map[string]interface{}{
+                {"role": "user", "content": fmt.Sprintf(`Please anonymize the text by redacting any names of people with REDACTED. Here is the text: %s`, text)},
+            },
+            "max_tokens": 500,
+        }
     }
 
+    return c.makeRequest(ctx, payload)
+}
+
+func (c *HTTPClient) makeRequest(ctx context.Context, payload interface{}) (string, error) {
     jsonPayload, err := json.Marshal(payload)
     if err != nil {
         return "", fmt.Errorf("failed to marshal JSON payload: %w", err)
     }
 
-    req, err := http.NewRequestWithContext(ctx, "POST", openAIURL, bytes.NewBuffer(jsonPayload))
+    req, err := http.NewRequestWithContext(ctx, "POST", c.url, bytes.NewBuffer(jsonPayload))
     if err != nil {
         return "", fmt.Errorf("failed to create request: %w", err)
     }
 
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("Authorization", "Bearer "+c.apiKey)
+    req.Header.Set("Content-Type", contentType)
+    if c.apiKey != "" {
+        req.Header.Set(authHeader, "Bearer "+c.apiKey)
+    }
 
     resp, err := c.client.Do(req)
     if err != nil {
@@ -88,7 +103,7 @@ func (c *openAIClient) Anonymize(ctx context.Context, text string) (string, erro
     defer resp.Body.Close()
 
     if resp.StatusCode != http.StatusOK {
-        return "", fmt.Errorf("OpenAI API returned non-200 status: %s", resp.Status)
+        return "", fmt.Errorf("API returned non-200 status: %s", resp.Status)
     }
 
     var result OpenAIResponse
@@ -97,7 +112,7 @@ func (c *openAIClient) Anonymize(ctx context.Context, text string) (string, erro
     }
 
     if len(result.Choices) == 0 {
-        return "", fmt.Errorf("no choices returned from OpenAI API")
+        return "", fmt.Errorf("no choices returned from API")
     }
 
     return postProcessAnonymizedText(result.Choices[0].Message.Content), nil
@@ -109,6 +124,25 @@ func postProcessAnonymizedText(text string) string {
 }
 
 func main() {
+    logger := initLogger()
+    loadEnv(logger)
+
+    apiKey := getAPIKey(logger)
+    openAIClient := NewHTTPClient(apiKey, openAIURL, openAITimeout)
+    spacyClient := NewHTTPClient("", spacyURL, 0)
+
+    router := gin.Default()
+    router.Use(cors.Default())
+    router.POST("/anonymize-gpt", anonymizeHandler(openAIClient, logger, false))
+    router.POST("/anonymize-spacy", anonymizeHandler(spacyClient, logger, true))
+
+    logger.Info("Starting server on port 8080")
+    if err := router.Run(":8080"); err != nil {
+        logger.Fatalf("Failed to run server: %v", err)
+    }
+}
+
+func initLogger() *logrus.Logger {
     logger := logrus.New()
     logger.SetFormatter(&logrus.TextFormatter{
         FullTimestamp:   true,
@@ -117,29 +151,24 @@ func main() {
         TimestampFormat: time.RFC3339,
     })
     logger.SetLevel(logrus.InfoLevel)
+    return logger
+}
 
+func loadEnv(logger *logrus.Logger) {
     if err := godotenv.Load(); err != nil {
         logger.Fatalf("Error loading .env file: %v", err)
     }
+}
 
+func getAPIKey(logger *logrus.Logger) string {
     apiKey := os.Getenv("OPENAI_API_KEY")
     if apiKey == "" {
         logger.Fatal("Missing OpenAI API key")
     }
-
-    openAIClient := NewOpenAIClient(apiKey)
-
-    router := gin.Default()
-    router.Use(cors.Default())
-    router.POST("/anonymize", AnonymizeTextHandler(openAIClient, logger))
-
-    logger.Info("Starting server on port 8080")
-    if err := router.Run(":8080"); err != nil {
-        logger.Fatalf("Failed to run server: %v", err)
-    }
+    return apiKey
 }
 
-func AnonymizeTextHandler(openAIClient OpenAIClient, logger *logrus.Logger) gin.HandlerFunc {
+func anonymizeHandler(client Client, logger *logrus.Logger, isSpacy bool) gin.HandlerFunc {
     return func(c *gin.Context) {
         var req Request
         if err := c.ShouldBindJSON(&req); err != nil {
@@ -148,14 +177,19 @@ func AnonymizeTextHandler(openAIClient OpenAIClient, logger *logrus.Logger) gin.
             return
         }
 
-        anonymizedText, err := openAIClient.Anonymize(c.Request.Context(), req.Text)
+        anonymizedText, err := client.Anonymize(c.Request.Context(), req.Text)
         if err != nil {
-            logger.Errorf("Failed to call OpenAI API: %v", err)
+            logger.Errorf("Failed to anonymize text: %v", err)
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
 
-        logger.Info("Successfully anonymized text")
+        logger.Infof("Successfully anonymized text using %s", func() string {
+            if isSpacy {
+                return "spaCy"
+            }
+            return "OpenAI"
+        }())
         c.JSON(http.StatusOK, Response{AnonymizedText: anonymizedText})
     }
 }
